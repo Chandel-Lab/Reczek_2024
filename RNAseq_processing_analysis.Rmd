@@ -1,0 +1,551 @@
+---
+title: 'NDI1 DEA'
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+   
+# Setup   
+## Import packages   
+```{r setup}
+library(DESeq2)
+library(tidyverse)
+library(parallel)
+library(doParallel)
+library(BiocParallel)
+library(pheatmap)
+library(ggsci)
+library(Cairo)
+library(ggrepel)
+library(readxl)
+library(WGCNA)
+library(RColorBrewer)
+library(ggsignif)
+library(broom)
+library(patchwork)
+library(ggplotify)
+library(ggprism)
+
+source("~/utils/R/k_means_figure.R")
+source("~/utils/R/pretty_MA_plot.R")
+source("~/utils/R/plotPCA_manual.R")
+source("~/utils/R/get_tidy_counts.R")
+source("~/utils/R/go_enrichment.R")
+source("~/utils/R/get_pairwise_DESeq.R")
+
+registerDoParallel(makeCluster(12))
+register(MulticoreParam(12))
+
+pal = pal_npg("nrc")(9)
+
+mitocarta = read_excel("/projects/b1205/resources/Mouse.MitoCarta3.0.xls", 
+                       sheet = "C MitoPathways")
+ci_genes = mitocarta %>% 
+  dplyr::filter(MitoPathway == "Complex I") %>% 
+  .$Genes %>% 
+  as.character() %>% 
+  strsplit(., split = ", ") %>% 
+  unlist()
+
+ci_subunit_genes = mitocarta %>% 
+  dplyr::filter(MitoPathway == "CI subunits") %>% 
+  .$Genes %>% 
+  as.character() %>% 
+  strsplit(., split = ", ") %>% 
+  unlist()
+
+all_mitocarta = mitocarta %>% 
+  .$Genes %>% 
+  as.character() %>% 
+  strsplit(., split = ", ") %>% 
+  unlist() %>% 
+  unique()
+
+prism_pal = prism_colour_pal(palette = "colors")(20)
+genotype_pal = c("NDI1" = prism_pal[1], "Control" = prism_pal[2])
+```   
+   
+# Low-level processing   
+## Batch 1   
+### Generate fastq   
+~/metformin/rgrant/231120_bcl_convert_metformin.sh
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 2:00:00
+#SBATCH -N 1
+#SBATCH --mem=64G
+#SBATCH --ntasks-per-node=18
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name='240814_bcl_convert_Colleen'
+
+module purge
+/projects/b1205/Rogan/Colleen_Metformin/230921_VH01039_164_AACV7FHM5
+module load bcl-convert/4.0.3
+bcl-convert --bcl-input-directory '/projects/b1205/Rogan/Colleen_Metformin/230921_VH01039_164_AACV7FHM5/' \
+--output-directory '/projects/b1205/Rogan/Colleen_Metformin/230921_VH01039_164_AACV7FHM5/bcl-convert' \
+--bcl-num-conversion-threads 6 \
+--bcl-num-compression-threads 6 \
+--bcl-num-decompression-threads 6
+```   
+   
+### Assemble metadata   
+```{r}
+md_b1 =  tibble(fastq_1 = list.files("/projects/b1205/Rogan/Colleen_Metformin/230921_VH01039_164_AACV7FHM5/bcl-convert",
+                                      pattern = "WB-.+\\.fastq.gz",
+                                      full.names = TRUE)) %>% 
+  dplyr::mutate(sample = substring(basename(fastq_1), 
+                                   1,
+                                   regexpr("S\\d+_R\\d", basename(fastq_1)) - 2),
+                genotype = factor(case_when(grepl("C[VMN]", sample) ~ "Control",
+                                            grepl("E[VMN]", sample) ~ "NDI1")),
+                strandedness = "unstranded",
+                fastq_2 = "") %>% 
+   dplyr::relocate(sample, fastq_1, fastq_2, strandedness) %>% 
+  dplyr::filter(grepl("[CER]V", sample))
+
+write_csv(md_b1, "~/metformin/data/240814_colleen_metforim_md.csv")
+```   
+   
+### Run rnaseq   
+```{bash eval=FALSE}
+screen
+cd /projects/b1205/Rogan/Colleen_Metformin/230921_VH01039_164_AACV7FHM5
+module purge
+module load singularity
+module load graphviz/2.40.1
+module load java/jdk11.0.10
+
+
+nextflow run nf-core/rnaseq \
+-r '3.12.0' \
+-profile nu_genomics \
+--email 'rogan@northwestern.edu' \
+--genome 'GRCm38' \
+--additional_fasta '/home/rag0151/metformin/data/transgenes_ndi1.fa' \
+--star_index false \
+-work-dir '/projects/b1205/Rogan/scratch' \
+--input '/home/rag0151/metformin/data/240814_colleen_metforim_md.csv' \
+--outdir '/projects/b1205/Rogan/Colleen_Metformin/230921_VH01039_164_AACV7FHM5/results_genotype'
+```   
+   
+## Batch 2   
+### Generate fastq   
+~/metformin/rgrant/240717_bcl_convert_metformin_batch2.sh
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 2:00:00
+#SBATCH -N 1
+#SBATCH --mem=64G
+#SBATCH --ntasks-per-node=18
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name='240814_bcl_convert_Colleen'
+
+module purge
+/projects/b1205/Rogan/Colleen_Metformin/240702_VH01039_269_AAFTCHFM5
+module load bcl-convert/4.0.3
+bcl-convert --bcl-input-directory '/projects/b1205/Rogan/Colleen_Metformin/240702_VH01039_269_AAFTCHFM5/' \
+--output-directory '/projects/b1205/Rogan/Colleen_Metformin/240702_VH01039_269_AAFTCHFM5/bcl-convert' \
+--bcl-num-conversion-threads 6 \
+--bcl-num-compression-threads 6 \
+--bcl-num-decompression-threads 6
+```   
+   
+### Assemble metadata   
+```{r}
+md_b2 =  tibble(fastq_1 = list.files("/projects/b1205/Rogan/Colleen_Metformin/240702_VH01039_269_AAFTCHFM5/bcl-convert",
+                                      pattern = "WB.+\\.fastq.gz",
+                                      full.names = TRUE)) %>% 
+  dplyr::mutate(sample = substring(basename(fastq_1), 
+                                   1,
+                                   regexpr("S\\d+_R\\d", basename(fastq_1)) - 2),
+                genotype = factor(case_when(grepl("C[VMN]", sample) ~ "Control",
+                                            grepl("E[VMNT]", sample) ~ "NDI1")),
+                strandedness = "unstranded",
+                fastq_2 = "") %>% 
+   dplyr::relocate(sample, fastq_1, fastq_2, strandedness) %>% 
+  dplyr::filter(grepl("[CER]V", sample))
+
+write_csv(md_b2, "~/metformin/data/240814_colleen_metformin_md_b2.csv")
+```   
+   
+### Run rnaseq   
+```{bash eval=FALSE}
+screen
+cd /projects/b1205/Rogan/Colleen_Metformin/240702_VH01039_269_AAFTCHFM5
+module purge
+module load singularity
+module load graphviz/2.40.1
+module load java/jdk11.0.10
+
+
+nextflow run nf-core/rnaseq \
+-r '3.12.0' \
+-profile nu_genomics \
+--email 'rogan@northwestern.edu' \
+--genome 'GRCm38' \
+--additional_fasta '/home/rag0151/metformin/data/transgenes_ndi1.fa' \
+--star_index false \
+-work-dir '/projects/b1205/Rogan/scratch' \
+--input '/home/rag0151/metformin/data/240814_colleen_metformin_md_b2.csv' \
+--outdir '/projects/b1205/Rogan/Colleen_Metformin/240702_VH01039_269_AAFTCHFM5/results_genotype'
+```   
+   
+## Import into DESeq and merge   
+### Batch 1   
+```{r}
+#import gene conversion
+mouse_conv = read_tsv("/projects/b1205/Rogan/Colleen_Metformin/230921_VH01039_164_AACV7FHM5/results_genotype/star_salmon/salmon.merged.gene_counts_length_scaled.tsv") %>% 
+   dplyr::select(ensembl_gene_id = gene_id, external_gene_name = gene_name)  %>%
+  dplyr::mutate(external_gene_name = factor(case_when(external_gene_name == "Cre_NC_005856.1_gene" ~ 
+                                                        "Cre (NC_005856.1)",
+                                                      external_gene_name == "NDI1__NM_001182483.1_gene" ~ 
+                                                        "NDI1 (NM_001182483.1)",
+                                                      TRUE ~ external_gene_name)))
+
+#import des
+load("/projects/b1205/Rogan/Colleen_Metformin/230921_VH01039_164_AACV7FHM5/results_genotype/star_salmon/deseq2_qc/deseq2.dds.RData")
+
+tmp = colData(dds) %>% 
+   as.data.frame() %>%
+   dplyr::select(-sizeFactor)
+
+md_b1_final = md_b1 %>% 
+   dplyr::mutate(sample = gsub("-", ".", sample)) %>% 
+   left_join(tmp, .) %>% 
+  dplyr::select(-starts_with("fastq"), -strandedness) %>% 
+  unique() %>% 
+  remove_rownames() %>% 
+  mutate(sample_id = sample,
+         batch = "Batch 1") %>% 
+  column_to_rownames("sample")
+
+counts_b1 = counts(dds, normalized = FALSE)
+```   
+   
+### Batch 2   
+```{r}
+load("/projects/b1205/Rogan/Colleen_Metformin/240702_VH01039_269_AAFTCHFM5/results_genotype/star_salmon/deseq2_qc/deseq2.dds.RData")
+
+tmp = colData(dds) %>% 
+   as.data.frame() %>%
+   dplyr::select(-sizeFactor)
+
+md_b2_final = md_b2 %>% 
+  dplyr::mutate(sample = gsub("-", ".", sample)) %>% 
+   left_join(tmp, .) %>% 
+  dplyr::select(-starts_with("fastq"), -strandedness) %>% 
+  unique() %>% 
+  remove_rownames() %>% 
+  mutate(sample_id = sample,
+         batch = "Batch 2") %>% 
+  column_to_rownames("sample")
+
+counts_b2 = counts(dds, normalized = FALSE)
+
+all_md = bind_rows(md_b1_final, md_b2_final) %>% 
+  dplyr::mutate(mouse = gsub("_|\\.", "-", sample_id),
+                mouse = substring(mouse, 1, regexpr("-\\d{3}", mouse) + 3),
+                cre_line = factor(ifelse(grepl("N", mouse),
+                                  yes = "New",
+                                  no = "Old")))
+rownames(all_md) = all_md$sample_id
+
+all_counts = cbind(counts_b1, counts_b2)
+
+all(colnames(all_counts) == rownames(all_md)) #TRUE
+des = DESeqDataSetFromMatrix(countData = all_counts, 
+                                  colData = all_md,
+                                  design = ~ genotype)
+```
+   
+# Basic QC   
+## PCA   
+```{r}
+not_transgenes = setdiff(rownames(des), c("Cre_NC_005856.1_gene", "NDI1__NM_001182483.1_gene"))
+pca = plotPCA_manual(object = vst(des[not_transgenes, ], blind = T), 
+                     intgroup = "genotype", 
+                     pcs = 3, 
+                     ntop = nrow(des),
+                     merge_metadata = TRUE,
+                     return_loadings = TRUE,
+                     custom_annotation = mouse_conv)
+
+ggplot(pca$data, aes(x = PC1, y = PC2, color = genotype, shape = batch)) +
+   geom_point(size = 4)  +
+   labs(x = paste0("PC1 (", pca$percent_var$percent_var[1], "% of variance explained)"),
+        y = paste0("PC2 (", pca$percent_var$percent_var[2], "% of variance explained)")) +
+   #geom_label_repel(aes(label = sample_id)) +
+   theme_bw(base_family = "Arial")
+ggplot(pca$data, aes(x = PC2, y = PC3, color = genotype, shape = batch)) +
+   geom_point(size = 4) +
+   labs(x = paste0("PC2 (", pca$percent_var$percent_var[2], "% of variance explained)"),
+        y = paste0("PC3 (", pca$percent_var$percent_var[3], "% of variance explained)")) +
+   theme_bw(base_family = "Arial")
+```  
+   
+   
+### Publication version   
+```{r}
+pca_publication = plotPCA_manual(object = vst(des[not_transgenes, ], blind = F), 
+                     intgroup = "genotype", 
+                     pcs = 3, 
+                     ntop = nrow(des),
+                     merge_metadata = TRUE,
+                     return_loadings = TRUE,
+                     custom_annotation = mouse_conv)
+
+pca_plot_publication = ggplot(pca_publication$data, aes(x = PC1, y = PC2, color = genotype)) +
+   geom_point(size = 4)  +
+   scale_color_npg(name = "Genotype") +
+   labs(x = paste0("PC1 (", pca$percent_var$percent_var[1], "% of variance explained)"),
+        y = paste0("PC2 (", pca$percent_var$percent_var[2], "% of variance explained)")) +
+   theme_bw(base_family = "Arial") 
+
+CairoPDF("~/metformin/240814_publication_pca.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+pca_plot_publication
+dev.off()
+
+pca_plot_publication
+```  
+   
+## Find best fit   
+```{r}
+parametric = DESeq(des,
+                   fitType = "parametric",
+                   parallel = T)
+plotDispEsts(parametric) #realistically this is pretty good
+
+local = DESeq(des,
+              fitType = "local",
+              parallel = T)
+plotDispEsts(local) #modestly better, keep
+
+dge = local
+
+saveRDS(dge, "~/metformin/data/240814_complete_dge.rds")
+rm(local, parametric)
+```
+   
+## Determine expression cutoff   
+### Plot expression vs coefficient of variation   
+```{r}
+expression_sum = data.frame(mean_expression = rowSums(counts(dge, normalized = T), na.rm = T),
+                            CV = rowSds(counts(dge, normalized = T), na.rm = T) / rowMeans(counts(dge, normalized = T), na.rm = T))
+
+ggplot(expression_sum, aes(x = mean_expression + 0.5, y = CV)) +
+  geom_point(alpha = 0.1) +
+  geom_density2d() +
+  scale_x_log10() +
+  geom_vline(xintercept = 2, linetype = 2) +
+  geom_rug(alpha = 0.01)
+```
+   
+Noise seems to drop off after a mean of 2 counts
+   
+### Apply cutoff and get gene list   
+```{r}
+expressed_genes = counts(dge, normalized = T) %>% 
+  as.data.frame() %>% 
+  .[rowSums(.) >= 2, ] %>% 
+  rownames()
+```
+   
+# DEA   
+## MA Plot   
+```{r}
+res = results(dge, contrast = c("genotype", "NDI1", "Control"), 
+              alpha = 0.05, parallel = TRUE) %>% 
+  as.data.frame()
+  
+big_hits = res %>% 
+  dplyr::filter(padj < 0.05 & 
+                  (abs(log2FoldChange > 1) | baseMean > 1e3)) %>% 
+  id_convert(., custom_annotation = mouse_conv) %>% 
+  .$external_gene_name %>% 
+  as.character() %>% 
+  .[!grepl("Rik", .)]
+
+genotype_MA = pretty_MA_plot(results = res,
+                           custom_annotation = mouse_conv,
+                           label_only_sig = TRUE, 
+                           genes = c(all_mitocarta, big_hits),
+                           label_oor = TRUE, label_text_size = (12 / .pt)) +
+  annotate(geom = "text", x = 5e4, y = 9.5,
+           label = paste(nrow(subset(res, padj < 0.05 & log2FoldChange > 0)), "genes upregulated in NDI1"),
+           color = "firebrick4", size = 5) +
+   annotate(geom = "text", x = 5e4, y = -4.5,
+           label = paste(nrow(subset(res, padj < 0.05 & log2FoldChange < 0)), "genes downregulated in NDI1"),
+           color = "dodgerblue4", size = 5) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 18),
+        axis.text.y = element_text(size = 18),
+        axis.title.x = element_text(size = 24),
+        axis.title.y = element_text(size = 24),
+         strip.text = element_text(size = 24))
+
+CairoPDF("~/metformin/data/240814_genotype_MA_plot.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+genotype_MA
+dev.off()
+
+genotype_MA
+```   
+   
+### Transgene expression   
+```{r}
+ndi1_comps = res %>% 
+  id_convert(., custom_annotation = mouse_conv) %>% 
+  dplyr::filter(external_gene_name == "NDI1 (NM_001182483.1)") %>% 
+  dplyr::mutate(group1 = "Control", group2 = "NDI1",
+                yval = 470,
+                annot = format(padj, scientific = T, digits = 2))
+
+transgene_counts = get_tidy_counts(dge, 
+                                   goi = c("NDI1__NM_001182483.1_gene"),
+                                   custom_annotation = mouse_conv)
+
+transgene_pub_plot = ggplot(transgene_counts, aes(x = genotype, y = counts, fill = genotype)) +
+   facet_wrap(~external_gene_name, scales = "free_y") +
+   geom_boxplot(outlier.shape = NA) +
+   geom_point(position = position_jitterdodge(seed = 12345, jitter.width = 0.8)) +
+   scale_fill_manual(values = genotype_pal) +
+   theme_bw() +
+   theme(strip.background = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+         strip.text = element_text(size = 18)) +
+  labs(x = "", y = "DESeq2-Normalized Gene Counts") +
+  geom_signif(inherit.aes = F,
+              data = ndi1_comps,
+              aes(xmin = group1, xmax = group2, annotations = annot, y_position = yval),
+              tip_length = 0,
+              textsize = 3,
+              manual=TRUE)
+
+CairoPDF("~/metformin/data/240814_transgene_gene_boxplots.pdf",
+    width = 5,
+    height = 5,
+    family = "Arial")
+transgene_pub_plot 
+dev.off()
+
+transgene_pub_plot 
+```
+   
+## Get modular expression   
+### Standard counts   
+```{r}
+ci_module_counts = get_tidy_counts(dge, goi = ci_genes, 
+                                             goi_format = "external_gene_name", 
+                                             custom_annotation = mouse_conv) %>% 
+  dplyr::mutate(gene_list = "Complex I Subunits (Mitocarta 3.0)") %>% 
+  group_by(sample, genotype, gene_list) %>% 
+  dplyr::summarize(summed_counts = sum(counts, na.rm = T)) %>% 
+  ungroup() 
+```
+
+## Stats   
+### Normal?   
+```{r}
+ggplot(ci_module_counts, aes(x = summed_counts)) +
+  geom_histogram() 
+
+shapiro.test(ci_module_counts$summed_counts)
+
+```   
+   
+Slightly skewed but really not bad. Use t-tests.   
+
+### t-tests
+```{r}
+ci_comps_counts = lapply(unique(ci_module_counts$gene_list), function(list){
+  sub = subset(ci_module_counts, gene_list == list)
+  comps = pairwise.t.test(x = sub$summed_counts, g = sub$genotype, 
+                                       p.adjust.method = "none") %>%
+    tidy() %>% 
+    dplyr::mutate(gene_list = list,
+                  max_y = max(sub$summed_counts)) }) %>% 
+  bind_rows() %>% 
+  dplyr::mutate(padj = p.adjust(p.value, method = "fdr")) %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  group_by(gene_list) #%>% 
+  # dplyr::mutate(yval = seq(from = first(max_y) * 0.8, 
+  #                          by = first(max_y) * 0.1, 
+  #                          length.out = n()),
+  #               annot = format(padj, scientific = T, digits = 2)) %>% 
+  # ungroup()
+```   
+   
+## Plot   
+```{r}
+ci_plot_counts = ggplot(ci_module_counts, aes(x = genotype, y = summed_counts, fill = genotype)) +
+  facet_wrap(~gene_list, scales = "free_y") +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2), size = 0.5) +
+  theme_bw() +
+  scale_fill_npg() +
+  labs(x = "", y = "Summed Module Expression (Counts)") +
+  theme(strip.background = element_blank(),
+        legend.position = "none")
+  # geom_signif(inherit.aes = F, 
+  #             data = ci_comps_counts,
+  #             aes(xmin = group1, xmax = group2, annotations = annot, y_position = yval),
+  #             tip_length = 0,
+  #             textsize = 3, 
+  #             manual=TRUE) 
+
+CairoPDF("~/metformin/data/240814_CI_module_counts.pdf",
+    width = 6,
+    height = 5,
+    family = "Arial")
+ci_plot_counts
+dev.off()
+
+ci_plot_counts
+```   
+   
+
+   
+# Data output   
+## Counts (normalized)   
+```{r}
+out = counts(dge, normalized = T) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., mouse_conv) %>% 
+  dplyr::relocate(ensembl_gene_id, external_gene_name)
+write.csv(out, "~/metformin/240814_normalized_counts.csv")
+```
+
+## Raw data for GEO   
+```{r}
+counts(dge, normalized = F) %>% 
+  as.data.frame() %>% 
+  write_csv(., "~/metformin/raw_counts_GEO.csv")
+
+colData(dge) %>% 
+  as.data.frame() %>% 
+  dplyr::mutate(genotype = gsub("Control", "C57BL/6J Wild-Type", genotype)) %>% 
+  group_by(genotype) %>% 
+  mutate(sample_number = c(1:n())) %>% 
+  ungroup() %>% 
+  mutate(title = paste("Liver", genotype, sample_number, sep = ", ")) %>% 
+  dplyr::select(genotype, title) %>% 
+   write_csv(., "~/metformin/metadata_GEO.csv")
+```
+
